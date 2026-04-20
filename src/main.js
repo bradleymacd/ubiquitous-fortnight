@@ -12,7 +12,9 @@ import {
 } from "./wakeLock.js";
 import { cancelSpeech, ensureSpeechUnlocked, speak } from "./voice.js";
 
-const appEl = document.querySelector("#app");
+function getAppRoot() {
+  return document.getElementById("app");
+}
 
 const PHASE = {
   countdown: "countdown",
@@ -27,34 +29,13 @@ const STATUS = {
   done: "done",
 };
 
-const DURATION_OPTIONS = buildDurationOptions(); // [{ seconds, label }]
-
-const state = {
-  // Config (seconds / integer)
-  workDuration: 20,
-  restDuration: 10,
-  totalRounds: 8,
-
-  // Runtime
-  timeRemaining: 20,
-  isRunning: false,
-  currentPhase: PHASE.work,
-  currentRound: 1,
-  status: STATUS.setup,
-
-  // Smooth progress bar timing
-  phaseEndsAtMs: null,
-  phaseDurationMs: null,
-  pausedPhaseRemainingMs: null,
-};
-
-let intervalId = null;
-let lastCountdownBeepAt = null; // string key: `${phase}:${round}:${seconds}`
-let rafId = null;
-let lastRoundCalloutAt = null; // `${phase}:${round}:${seconds}`
-let lastTickShownSeconds = null;
-
-render();
+// Declared before boot() — synchronous boot runs render → totalWorkoutSeconds before rest of file evaluates.
+function formatMMSS(totalSeconds) {
+  const clamped = Math.max(0, Math.floor(totalSeconds));
+  const mm = String(Math.floor(clamped / 60)).padStart(2, "0");
+  const ss = String(clamped % 60).padStart(2, "0");
+  return `${mm}:${ss}`;
+}
 
 function buildDurationOptions() {
   const opts = [];
@@ -69,16 +50,114 @@ function buildDurationOptions() {
   return opts;
 }
 
-function formatMMSS(totalSeconds) {
-  const clamped = Math.max(0, Math.floor(totalSeconds));
-  const mm = String(Math.floor(clamped / 60)).padStart(2, "0");
-  const ss = String(clamped % 60).padStart(2, "0");
-  return `${mm}:${ss}`;
+/** Matches current app: 10s initial countdown + N×work + (N−1)×rest (no rest after final work). */
+const INITIAL_COUNTDOWN_SECONDS = 10;
+
+function totalWorkoutSeconds(workSec, restSec, rounds) {
+  const n = Math.max(1, Math.floor(rounds));
+  return INITIAL_COUNTDOWN_SECONDS + n * workSec + (n - 1) * restSec;
+}
+
+let durationOptionsCache = null;
+function getDurationOptions() {
+  if (!durationOptionsCache) {
+    durationOptionsCache = buildDurationOptions();
+  }
+  return durationOptionsCache;
+}
+
+const state = {
+  // Config (seconds / integer)
+  workDuration: 20,
+  restDuration: 10,
+  totalRounds: 8,
+
+  // Runtime
+  timeRemaining: 20,
+  isRunning: false,
+  currentPhase: PHASE.work,
+  currentRound: 1,
+  status: STATUS.setup,
+
+  // Audio toggles (no persistence by design)
+  voiceEnabled: true,
+  beepsEnabled: true,
+
+  // Smooth progress bar timing
+  phaseEndsAtMs: null,
+  phaseDurationMs: null,
+  pausedPhaseRemainingMs: null,
+};
+
+let intervalId = null;
+let lastCountdownBeepAt = null; // string key: `${phase}:${round}:${seconds}`
+let rafId = null;
+let lastRoundCalloutAt = null; // `${phase}:${round}:${seconds}`
+let lastTickShownSeconds = null;
+
+function boot() {
+  try {
+    render();
+  } catch (err) {
+    console.error(err);
+    const root = getAppRoot();
+    if (root) {
+      root.innerHTML = `
+        <main class="card" style="padding: 18px;" aria-live="assertive">
+          <h1 class="title">Could not start timer</h1>
+          <p class="subtitle" style="margin-top:8px;color:var(--danger);">${String(
+            err?.message ?? err
+          )}</p>
+          <p class="subtitle" style="margin-top:12px">Try a hard refresh (clear cache) or run <code style="font-size:12px">npm run dev</code> from the project folder.</p>
+        </main>
+      `;
+    }
+  }
+}
+if (document.readyState === "loading") {
+  document.addEventListener("DOMContentLoaded", boot);
+} else {
+  boot();
 }
 
 function phaseLabel(phase) {
   if (phase === PHASE.countdown) return "GET READY";
   return phase === PHASE.work ? "WORK" : "REST";
+}
+
+function speakerOnIcon() {
+  return `
+    <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+      <path fill="currentColor" d="M14 3.23v17.54c0 1.13-1.27 1.81-2.22 1.2L7.9 19H5a3 3 0 0 1-3-3v-4a3 3 0 0 1 3-3h2.9l3.88-3.97c.95-.61 2.22.07 2.22 1.2ZM16.5 8.5a1 1 0 0 1 1.41 0a6 6 0 0 1 0 8.49a1 1 0 1 1-1.41-1.41a4 4 0 0 0 0-5.66a1 1 0 0 1 0-1.42Zm2.83-2.83a1 1 0 0 1 1.41 0a10 10 0 0 1 0 14.14a1 1 0 1 1-1.41-1.41a8 8 0 0 0 0-11.32a1 1 0 0 1 0-1.41Z"/>
+    </svg>
+  `;
+}
+
+function speakerOffIcon() {
+  return `
+    <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+      <path fill="currentColor" d="M14 3.23v17.54c0 1.13-1.27 1.81-2.22 1.2L7.9 19H5a3 3 0 0 1-3-3v-4a3 3 0 0 1 3-3h2.9l3.88-3.97c.95-.61 2.22.07 2.22 1.2Z"/>
+      <path fill="currentColor" d="M17.59 8.59a1 1 0 0 1 1.41 0L21 10.59l1.99-2a1 1 0 1 1 1.42 1.42L22.41 12l2 1.99a1 1 0 0 1-1.42 1.42L21 13.41l-2 2a1 1 0 0 1-1.41-1.42L19.59 12l-2-1.99a1 1 0 0 1 0-1.42Z"/>
+    </svg>
+  `;
+}
+
+function bellOnIcon() {
+  return `
+    <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+      <path fill="currentColor" d="M12 22a2.5 2.5 0 0 0 2.45-2h-4.9A2.5 2.5 0 0 0 12 22Zm6-6V11a6 6 0 1 0-12 0v5L4 18v1h16v-1l-2-2Z"/>
+    </svg>
+  `;
+}
+
+function bellOffIcon() {
+  return `
+    <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+      <path fill="currentColor" d="M12 22a2.5 2.5 0 0 0 2.45-2h-4.9A2.5 2.5 0 0 0 12 22Z"/>
+      <path fill="currentColor" d="M4 18v1h16v-1l-2-2V11c0-1.2-.35-2.32-.95-3.27l-1.5 1.5c.29.55.45 1.18.45 1.77v5.83l1.17 1.17H6.83L6 17.83V11c0-.64.14-1.25.4-1.8L4.9 7.7A5.96 5.96 0 0 0 4 11v5l-2 2Z"/>
+      <path fill="currentColor" d="M3.29 4.71a1 1 0 0 1 1.42-1.42l16 16a1 1 0 1 1-1.42 1.42l-16-16Z"/>
+    </svg>
+  `;
 }
 
 function stopInterval() {
@@ -201,9 +280,9 @@ function done() {
 }
 
 function finishWorkout() {
-  playWorkoutComplete();
+  if (state.beepsEnabled) playWorkoutComplete();
   done();
-  speak("Done, nice job!");
+  if (state.voiceEnabled) speak("Done, nice job!");
 }
 
 function advanceToNextPhase({ viaSkip }) {
@@ -215,8 +294,8 @@ function advanceToNextPhase({ viaSkip }) {
     state.currentRound = 1;
     enterPhase(PHASE.work, state.workDuration);
     // Work begins here (either naturally after countdown or via skip).
-    if (viaSkip) speak("Round one");
-    playWorkStart();
+    if (viaSkip && state.voiceEnabled) speak("Round one");
+    if (state.beepsEnabled) playWorkStart();
     render();
     return {
       from: fromPhase,
@@ -234,8 +313,8 @@ function advanceToNextPhase({ viaSkip }) {
       return { next: null, done: true, viaSkip };
     }
     enterPhase(PHASE.rest, state.restDuration);
-    playRestStart();
-    speak("Rest");
+    if (state.beepsEnabled) playRestStart();
+    if (state.voiceEnabled) speak("Rest");
     render();
     return {
       from: fromPhase,
@@ -250,10 +329,12 @@ function advanceToNextPhase({ viaSkip }) {
   state.currentRound += 1;
   enterPhase(PHASE.work, state.workDuration);
   if (viaSkip) {
-    if (state.currentRound === state.totalRounds) speak("Last Round");
-    else speak(`Round ${state.currentRound}`);
+    if (state.voiceEnabled) {
+      if (state.currentRound === state.totalRounds) speak("Last Round");
+      else speak(`Round ${state.currentRound}`);
+    }
   }
-  playWorkStart();
+  if (state.beepsEnabled) playWorkStart();
   render();
   return { next: PHASE.work, done: false, viaSkip };
 }
@@ -310,7 +391,7 @@ function maybeSpeakRoundAfterBeeps(prevShown, nowShown) {
 
   if (state.currentPhase === PHASE.countdown) {
     lastRoundCalloutAt = key;
-    speak("Round one");
+    if (state.voiceEnabled) speak("Round one");
     return;
   }
 
@@ -318,8 +399,10 @@ function maybeSpeakRoundAfterBeeps(prevShown, nowShown) {
   if (state.currentRound >= state.totalRounds) return;
   const nextRound = state.currentRound + 1;
   lastRoundCalloutAt = key;
-  if (nextRound === state.totalRounds) speak("Last Round");
-  else speak(`Round ${nextRound}`);
+  if (state.voiceEnabled) {
+    if (nextRound === state.totalRounds) speak("Last Round");
+    else speak(`Round ${nextRound}`);
+  }
 }
 
 function computeProgressNow() {
@@ -364,7 +447,7 @@ function maybePlayCountdownBeepsCrossing(prevShown, nowShown) {
     const key = `${state.currentPhase}:${state.currentRound}:${s}`;
     if (lastCountdownBeepAt === key) continue;
     lastCountdownBeepAt = key;
-    playCountdownBeep();
+    if (state.beepsEnabled) playCountdownBeep();
   }
 }
 
@@ -382,16 +465,23 @@ function setConfigFromSetup({ workDuration, restDuration, totalRounds }) {
 }
 
 function render() {
-  if (!appEl) return;
+  const root = getAppRoot();
+  if (!root) return;
 
   const view =
     state.status === STATUS.setup ? renderSetup() : renderRunOrDone();
 
-  appEl.innerHTML = view;
+  root.innerHTML = view;
   wireEvents();
 }
 
 function renderSetup() {
+  const totalSec = totalWorkoutSeconds(
+    state.workDuration,
+    state.restDuration,
+    state.totalRounds
+  );
+  const totalLabel = formatMMSS(totalSec);
   return `
     <main class="card" aria-label="Tabata timer setup">
       <div class="header">
@@ -406,7 +496,7 @@ function renderSetup() {
           <label>
             Work
             <select id="workSelect" aria-label="Work duration">
-              ${DURATION_OPTIONS.map(
+              ${getDurationOptions().map(
                 (o) =>
                   `<option value="${o.seconds}" ${
                     o.seconds === state.workDuration ? "selected" : ""
@@ -418,7 +508,7 @@ function renderSetup() {
           <label>
             Rest
             <select id="restSelect" aria-label="Rest duration">
-              ${DURATION_OPTIONS.map(
+              ${getDurationOptions().map(
                 (o) =>
                   `<option value="${o.seconds}" ${
                     o.seconds === state.restDuration ? "selected" : ""
@@ -445,7 +535,7 @@ function renderSetup() {
         </label>
 
         <div class="actions">
-          <button class="primary" id="startBtn">Start</button>
+          <button class="primary" id="startBtn" aria-label="Start workout, total time ${totalLabel}" type="button">Start · ${totalLabel}</button>
         </div>
       </div>
     </main>
@@ -483,6 +573,26 @@ function renderRunOrDone() {
         <div>
           <h1 class="title">Tabata Timer</h1>
           <p class="subtitle">${roundText}</p>
+        </div>
+        <div class="headerRight" aria-label="Audio controls">
+          <button
+            id="toggleVoiceBtn"
+            class="iconBtn ${state.voiceEnabled ? "" : "isOff"}"
+            type="button"
+            aria-label="${state.voiceEnabled ? "Mute voice" : "Unmute voice"}"
+            title="${state.voiceEnabled ? "Mute voice" : "Unmute voice"}"
+          >
+            ${state.voiceEnabled ? speakerOnIcon() : speakerOffIcon()}
+          </button>
+          <button
+            id="toggleBeepsBtn"
+            class="iconBtn ${state.beepsEnabled ? "" : "isOff"}"
+            type="button"
+            aria-label="${state.beepsEnabled ? "Mute beeps" : "Unmute beeps"}"
+            title="${state.beepsEnabled ? "Mute beeps" : "Unmute beeps"}"
+          >
+            ${state.beepsEnabled ? bellOnIcon() : bellOffIcon()}
+          </button>
         </div>
       </div>
 
@@ -570,6 +680,25 @@ function wireEvents() {
   if (resetBtn) {
     resetBtn.addEventListener("click", () => {
       resetToSetup();
+    });
+  }
+
+  const toggleVoiceBtn = document.querySelector("#toggleVoiceBtn");
+  if (toggleVoiceBtn) {
+    toggleVoiceBtn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      state.voiceEnabled = !state.voiceEnabled;
+      if (!state.voiceEnabled) cancelSpeech();
+      render();
+    });
+  }
+
+  const toggleBeepsBtn = document.querySelector("#toggleBeepsBtn");
+  if (toggleBeepsBtn) {
+    toggleBeepsBtn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      state.beepsEnabled = !state.beepsEnabled;
+      render();
     });
   }
 
