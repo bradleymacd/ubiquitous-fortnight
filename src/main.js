@@ -103,12 +103,10 @@ function boot() {
     const root = getAppRoot();
     if (root) {
       root.innerHTML = `
-        <main class="card" style="padding: 18px;" aria-live="assertive">
+        <main class="card card--padded" aria-live="assertive">
           <h1 class="title">Could not start timer</h1>
-          <p class="subtitle" style="margin-top:8px;color:var(--danger);">${String(
-            err?.message ?? err
-          )}</p>
-          <p class="subtitle" style="margin-top:12px">Try a hard refresh (clear cache) or run <code style="font-size:12px">npm run dev</code> from the project folder.</p>
+          <p class="subtitle error-text">${String(err?.message ?? err)}</p>
+          <p class="subtitle help-text">Try a hard refresh (clear cache) or run <code class="inline-code">npm run dev</code> from the project folder.</p>
         </main>
       `;
     }
@@ -518,7 +516,7 @@ function renderSetup() {
           </label>
         </div>
 
-        <div style="height: 12px;"></div>
+        <div class="field-gap" aria-hidden="true"></div>
 
         <label>
           Rounds
