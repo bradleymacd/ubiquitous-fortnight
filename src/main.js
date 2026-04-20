@@ -10,6 +10,7 @@ import {
   releaseWakeLock,
   requestWakeLockIfSupported,
 } from "./wakeLock.js";
+import { cancelSpeech, ensureSpeechUnlocked, speak } from "./voice.js";
 
 const appEl = document.querySelector("#app");
 
@@ -50,6 +51,8 @@ const state = {
 let intervalId = null;
 let lastCountdownBeepAt = null; // string key: `${phase}:${round}:${seconds}`
 let rafId = null;
+let lastRoundCalloutAt = null; // `${phase}:${round}:${seconds}`
+let lastTickShownSeconds = null;
 
 render();
 
@@ -140,6 +143,7 @@ function enterPhase(phase, durationSeconds) {
   state.phaseEndsAtMs = Date.now() + state.phaseDurationMs;
   state.pausedPhaseRemainingMs = null;
   lastCountdownBeepAt = null;
+  lastRoundCalloutAt = null;
 }
 
 function startWorkout() {
@@ -150,6 +154,7 @@ function startWorkout() {
 
 function pause() {
   if (state.status !== STATUS.running) return;
+  cancelSpeech();
   if (state.phaseEndsAtMs != null) {
     state.pausedPhaseRemainingMs = Math.max(0, state.phaseEndsAtMs - Date.now());
   }
@@ -169,6 +174,7 @@ function resetToSetup() {
   stopInterval();
   stopProgressLoop();
   releaseWakeLock();
+  cancelSpeech();
 
   state.status = STATUS.setup;
   state.isRunning = false;
@@ -190,7 +196,14 @@ function done() {
   state.phaseEndsAtMs = null;
   state.phaseDurationMs = null;
   state.pausedPhaseRemainingMs = null;
+  cancelSpeech();
   render();
+}
+
+function finishWorkout() {
+  playWorkoutComplete();
+  done();
+  speak("Done, nice job!");
 }
 
 function advanceToNextPhase({ viaSkip }) {
@@ -202,6 +215,7 @@ function advanceToNextPhase({ viaSkip }) {
     state.currentRound = 1;
     enterPhase(PHASE.work, state.workDuration);
     // Work begins here (either naturally after countdown or via skip).
+    if (viaSkip) speak("Round one");
     playWorkStart();
     render();
     return {
@@ -213,10 +227,15 @@ function advanceToNextPhase({ viaSkip }) {
     };
   }
 
-  // work -> rest (same round)
+  // work -> rest (same round), except after the final work — no rest, workout ends
   if (state.currentPhase === PHASE.work) {
+    if (state.currentRound === state.totalRounds) {
+      finishWorkout();
+      return { next: null, done: true, viaSkip };
+    }
     enterPhase(PHASE.rest, state.restDuration);
     playRestStart();
+    speak("Rest");
     render();
     return {
       from: fromPhase,
@@ -227,15 +246,13 @@ function advanceToNextPhase({ viaSkip }) {
     };
   }
 
-  // rest -> next work OR done
-  if (state.currentRound >= state.totalRounds) {
-    done();
-    playWorkoutComplete();
-    return { next: null, done: true, viaSkip };
-  }
-
+  // rest -> next work (final round never has a rest phase)
   state.currentRound += 1;
   enterPhase(PHASE.work, state.workDuration);
+  if (viaSkip) {
+    if (state.currentRound === state.totalRounds) speak("Last Round");
+    else speak(`Round ${state.currentRound}`);
+  }
   playWorkStart();
   render();
   return { next: PHASE.work, done: false, viaSkip };
@@ -248,13 +265,23 @@ function skipPhase() {
 
 function tick() {
   // Keep the display aligned to wall-clock time so the progress bar stays smooth.
+  const prevShown = state.timeRemaining;
   if (state.phaseEndsAtMs != null) {
     const remainingMs = Math.max(0, state.phaseEndsAtMs - Date.now());
-    const remainingSeconds = Math.ceil(remainingMs / 1000);
+    // Avoid boundary skips when remainingMs hits an exact multiple of 1000.
+    // Example seen in logs: 8001ms -> 9, then 7000ms -> 7 (skipping 8).
+    const durationMs = state.phaseDurationMs ?? null;
+    const boundaryBump =
+      remainingMs > 0 &&
+      remainingMs % 1000 === 0 &&
+      durationMs != null &&
+      remainingMs !== durationMs;
+    const remainingSeconds = Math.ceil(remainingMs / 1000) + (boundaryBump ? 1 : 0);
     state.timeRemaining = remainingSeconds;
   }
 
-  maybePlayCountdownBeeps();
+  maybeSpeakRoundAfterBeeps(prevShown, state.timeRemaining);
+  maybePlayCountdownBeepsCrossing(prevShown, state.timeRemaining);
 
   if (state.timeRemaining > 0) {
     render();
@@ -264,6 +291,35 @@ function tick() {
   state.timeRemaining = 0;
 
   advanceToNextPhase({ viaSkip: false });
+}
+
+function maybeSpeakRoundAfterBeeps(prevShown, nowShown) {
+  if (state.status !== STATUS.running) return;
+
+  // New behavior: voice comes after the 3-2-1 beeps, right before work begins.
+  // Trigger when countdown/rest hits 0 (or crosses to 0).
+  if (!(state.currentPhase === PHASE.countdown || state.currentPhase === PHASE.rest))
+    return;
+
+  const crossedToZero = prevShown > 0 && nowShown <= 0;
+  const atZero = nowShown === 0;
+  if (!crossedToZero && !atZero) return;
+
+  const key = `${state.currentPhase}:${state.currentRound}:to-work`;
+  if (lastRoundCalloutAt === key) return;
+
+  if (state.currentPhase === PHASE.countdown) {
+    lastRoundCalloutAt = key;
+    speak("Round one");
+    return;
+  }
+
+  // rest -> upcoming work (unless this is final rest, which goes to done)
+  if (state.currentRound >= state.totalRounds) return;
+  const nextRound = state.currentRound + 1;
+  lastRoundCalloutAt = key;
+  if (nextRound === state.totalRounds) speak("Last Round");
+  else speak(`Round ${nextRound}`);
 }
 
 function computeProgressNow() {
@@ -291,12 +347,25 @@ function shouldPlayFinalThreeBeeps() {
   return false;
 }
 
-function maybePlayCountdownBeeps() {
-  if (!shouldPlayFinalThreeBeeps()) return;
-  const key = `${state.currentPhase}:${state.currentRound}:${state.timeRemaining}`;
-  if (lastCountdownBeepAt === key) return;
-  lastCountdownBeepAt = key;
-  playCountdownBeep();
+function maybePlayCountdownBeepsCrossing(prevShown, nowShown) {
+  if (state.status !== STATUS.running) return;
+
+  // Fire beeps for 3/2/1 even if the display skips a number.
+  for (const s of [3, 2, 1]) {
+    const crossed = prevShown > s && nowShown <= s;
+    const at = nowShown === s;
+    if (!crossed && !at) continue;
+
+    // Respect the "final rest has no beeps" rule.
+    if (state.currentPhase === PHASE.rest && state.currentRound >= state.totalRounds) {
+      continue;
+    }
+
+    const key = `${state.currentPhase}:${state.currentRound}:${s}`;
+    if (lastCountdownBeepAt === key) continue;
+    lastCountdownBeepAt = key;
+    playCountdownBeep();
+  }
 }
 
 function setConfigFromSetup({ workDuration, restDuration, totalRounds }) {
@@ -449,6 +518,7 @@ function wireEvents() {
   if (startBtn) {
     startBtn.addEventListener("click", () => {
       ensureAudioUnlocked();
+      ensureSpeechUnlocked();
 
       // Read current UI picks right at Start.
       const workSelect = document.querySelector("#workSelect");
