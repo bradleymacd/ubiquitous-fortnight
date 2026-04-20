@@ -40,10 +40,16 @@ const state = {
   currentPhase: PHASE.work,
   currentRound: 1,
   status: STATUS.setup,
+
+  // Smooth progress bar timing
+  phaseEndsAtMs: null,
+  phaseDurationMs: null,
+  pausedPhaseRemainingMs: null,
 };
 
 let intervalId = null;
 let lastCountdownBeepAt = null; // string key: `${phase}:${round}:${seconds}`
+let rafId = null;
 
 render();
 
@@ -85,6 +91,30 @@ function startInterval() {
     if (!state.isRunning || state.status !== STATUS.running) return;
     tick();
   }, 1000);
+  startProgressLoop();
+}
+
+function startProgressLoop() {
+  if (rafId != null) return;
+
+  const loop = () => {
+    rafId = requestAnimationFrame(loop);
+    if (state.status !== STATUS.running) return;
+
+    const banner = document.querySelector("#phaseBanner");
+    if (!banner) return;
+
+    const p = computeProgressNow();
+    banner.style.setProperty("--p", String(p));
+  };
+
+  rafId = requestAnimationFrame(loop);
+}
+
+function stopProgressLoop() {
+  if (rafId == null) return;
+  cancelAnimationFrame(rafId);
+  rafId = null;
 }
 
 function setStatus(nextStatus) {
@@ -96,31 +126,48 @@ function setStatus(nextStatus) {
     requestWakeLockIfSupported();
   } else {
     stopInterval();
+    stopProgressLoop();
     releaseWakeLock();
   }
 
   render();
 }
 
+function enterPhase(phase, durationSeconds) {
+  state.currentPhase = phase;
+  state.timeRemaining = durationSeconds;
+  state.phaseDurationMs = durationSeconds * 1000;
+  state.phaseEndsAtMs = Date.now() + state.phaseDurationMs;
+  state.pausedPhaseRemainingMs = null;
+  lastCountdownBeepAt = null;
+}
+
 function startWorkout() {
   state.currentRound = 1;
-  state.currentPhase = PHASE.countdown;
-  state.timeRemaining = 10;
+  enterPhase(PHASE.countdown, 10);
   setStatus(STATUS.running);
 }
 
 function pause() {
   if (state.status !== STATUS.running) return;
+  if (state.phaseEndsAtMs != null) {
+    state.pausedPhaseRemainingMs = Math.max(0, state.phaseEndsAtMs - Date.now());
+  }
   setStatus(STATUS.paused);
 }
 
 function resume() {
   if (state.status !== STATUS.paused) return;
+  if (state.pausedPhaseRemainingMs != null) {
+    state.phaseEndsAtMs = Date.now() + state.pausedPhaseRemainingMs;
+    state.pausedPhaseRemainingMs = null;
+  }
   setStatus(STATUS.running);
 }
 
 function resetToSetup() {
   stopInterval();
+  stopProgressLoop();
   releaseWakeLock();
 
   state.status = STATUS.setup;
@@ -130,6 +177,9 @@ function resetToSetup() {
   state.currentRound = 1;
   state.currentPhase = PHASE.work;
   state.timeRemaining = state.workDuration;
+  state.phaseEndsAtMs = null;
+  state.phaseDurationMs = null;
+  state.pausedPhaseRemainingMs = null;
 
   render();
 }
@@ -137,6 +187,9 @@ function resetToSetup() {
 function done() {
   setStatus(STATUS.done);
   state.timeRemaining = 0;
+  state.phaseEndsAtMs = null;
+  state.phaseDurationMs = null;
+  state.pausedPhaseRemainingMs = null;
   render();
 }
 
@@ -146,9 +199,8 @@ function advanceToNextPhase({ viaSkip }) {
 
   // countdown -> work (round 1)
   if (state.currentPhase === PHASE.countdown) {
-    state.currentPhase = PHASE.work;
     state.currentRound = 1;
-    state.timeRemaining = state.workDuration;
+    enterPhase(PHASE.work, state.workDuration);
     // Work begins here (either naturally after countdown or via skip).
     playWorkStart();
     render();
@@ -163,8 +215,7 @@ function advanceToNextPhase({ viaSkip }) {
 
   // work -> rest (same round)
   if (state.currentPhase === PHASE.work) {
-    state.currentPhase = PHASE.rest;
-    state.timeRemaining = state.restDuration;
+    enterPhase(PHASE.rest, state.restDuration);
     playRestStart();
     render();
     return {
@@ -184,8 +235,7 @@ function advanceToNextPhase({ viaSkip }) {
   }
 
   state.currentRound += 1;
-  state.currentPhase = PHASE.work;
-  state.timeRemaining = state.workDuration;
+  enterPhase(PHASE.work, state.workDuration);
   playWorkStart();
   render();
   return { next: PHASE.work, done: false, viaSkip };
@@ -197,8 +247,11 @@ function skipPhase() {
 }
 
 function tick() {
-  if (state.timeRemaining > 0) {
-    state.timeRemaining -= 1;
+  // Keep the display aligned to wall-clock time so the progress bar stays smooth.
+  if (state.phaseEndsAtMs != null) {
+    const remainingMs = Math.max(0, state.phaseEndsAtMs - Date.now());
+    const remainingSeconds = Math.ceil(remainingMs / 1000);
+    state.timeRemaining = remainingSeconds;
   }
 
   maybePlayCountdownBeeps();
@@ -211,6 +264,15 @@ function tick() {
   state.timeRemaining = 0;
 
   advanceToNextPhase({ viaSkip: false });
+}
+
+function computeProgressNow() {
+  if (state.status !== STATUS.running) return 0;
+  if (!state.phaseEndsAtMs || !state.phaseDurationMs) return 0;
+  const now = Date.now();
+  const elapsed = state.phaseDurationMs - Math.max(0, state.phaseEndsAtMs - now);
+  const p = elapsed / state.phaseDurationMs;
+  return Math.max(0, Math.min(1, p));
 }
 
 function shouldPlayFinalThreeBeeps() {
@@ -344,8 +406,7 @@ function renderRunOrDone() {
 
   const pauseResumeText =
     state.status === STATUS.running ? "Pause" : "Resume";
-
-  const pauseResumeDisabled = isDone;
+  const showGoAgain = isDone;
 
   return `
     <main class="card" aria-label="Tabata timer running">
@@ -360,24 +421,22 @@ function renderRunOrDone() {
         <section id="phaseBanner" class="phaseBanner ${themeClass}" aria-live="polite">
           <div class="phaseLabel">${label}</div>
           <div class="countdown" aria-label="Time remaining">${countdownText}</div>
-          <div class="meta">
-            <span>${
-              isDone
-                ? "Workout complete"
-                : isCountdown
-                  ? "Get ready"
-                  : isWork
-                    ? "Work phase"
-                    : "Rest phase"
-            }</span>
-            <span>${isDone ? "" : (state.status === STATUS.paused ? "Paused" : "Running")}</span>
+          <div class="progressTrack" aria-hidden="true">
+            <div class="progressFill"></div>
           </div>
         </section>
 
         <div class="actions">
-          <button id="pauseResumeBtn" class="primary" ${
-            pauseResumeDisabled ? "disabled" : ""
-          } ${pauseResumeDisabled ? "disabled" : ""}>${pauseResumeText}</button>
+          ${
+            isDone
+              ? ""
+              : `<button id="pauseResumeBtn" class="primary">${pauseResumeText}</button>`
+          }
+          ${
+            showGoAgain
+              ? `<button id="goAgainBtn" class="primary">Go again</button>`
+              : ""
+          }
           <button id="resetBtn" class="danger">Reset</button>
         </div>
       </div>
@@ -441,6 +500,14 @@ function wireEvents() {
   if (resetBtn) {
     resetBtn.addEventListener("click", () => {
       resetToSetup();
+    });
+  }
+
+  const goAgainBtn = document.querySelector("#goAgainBtn");
+  if (goAgainBtn) {
+    goAgainBtn.addEventListener("click", () => {
+      // Re-run with the existing selected settings.
+      startWorkout();
     });
   }
 
