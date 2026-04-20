@@ -1,8 +1,20 @@
 import "./style.css";
+import {
+  ensureAudioUnlocked,
+  playCountdownBeep,
+  playRestStart,
+  playWorkStart,
+  playWorkoutComplete,
+} from "./audio.js";
+import {
+  releaseWakeLock,
+  requestWakeLockIfSupported,
+} from "./wakeLock.js";
 
 const appEl = document.querySelector("#app");
 
 const PHASE = {
+  countdown: "countdown",
   work: "work",
   rest: "rest",
 };
@@ -31,6 +43,7 @@ const state = {
 };
 
 let intervalId = null;
+let lastCountdownBeepAt = null; // string key: `${phase}:${round}:${seconds}`
 
 render();
 
@@ -55,6 +68,7 @@ function formatMMSS(totalSeconds) {
 }
 
 function phaseLabel(phase) {
+  if (phase === PHASE.countdown) return "GET READY";
   return phase === PHASE.work ? "WORK" : "REST";
 }
 
@@ -77,16 +91,21 @@ function setStatus(nextStatus) {
   state.status = nextStatus;
   state.isRunning = nextStatus === STATUS.running;
 
-  if (state.isRunning) startInterval();
-  else stopInterval();
+  if (state.isRunning) {
+    startInterval();
+    requestWakeLockIfSupported();
+  } else {
+    stopInterval();
+    releaseWakeLock();
+  }
 
   render();
 }
 
 function startWorkout() {
   state.currentRound = 1;
-  state.currentPhase = PHASE.work;
-  state.timeRemaining = state.workDuration;
+  state.currentPhase = PHASE.countdown;
+  state.timeRemaining = 10;
   setStatus(STATUS.running);
 }
 
@@ -102,6 +121,7 @@ function resume() {
 
 function resetToSetup() {
   stopInterval();
+  releaseWakeLock();
 
   state.status = STATUS.setup;
   state.isRunning = false;
@@ -120,10 +140,68 @@ function done() {
   render();
 }
 
+function advanceToNextPhase({ viaSkip }) {
+  const fromPhase = state.currentPhase;
+  const fromRound = state.currentRound;
+
+  // countdown -> work (round 1)
+  if (state.currentPhase === PHASE.countdown) {
+    state.currentPhase = PHASE.work;
+    state.currentRound = 1;
+    state.timeRemaining = state.workDuration;
+    // Work begins here (either naturally after countdown or via skip).
+    playWorkStart();
+    render();
+    return {
+      from: fromPhase,
+      fromRound,
+      next: PHASE.work,
+      done: false,
+      viaSkip,
+    };
+  }
+
+  // work -> rest (same round)
+  if (state.currentPhase === PHASE.work) {
+    state.currentPhase = PHASE.rest;
+    state.timeRemaining = state.restDuration;
+    playRestStart();
+    render();
+    return {
+      from: fromPhase,
+      fromRound,
+      next: PHASE.rest,
+      done: false,
+      viaSkip,
+    };
+  }
+
+  // rest -> next work OR done
+  if (state.currentRound >= state.totalRounds) {
+    done();
+    playWorkoutComplete();
+    return { next: null, done: true, viaSkip };
+  }
+
+  state.currentRound += 1;
+  state.currentPhase = PHASE.work;
+  state.timeRemaining = state.workDuration;
+  playWorkStart();
+  render();
+  return { next: PHASE.work, done: false, viaSkip };
+}
+
+function skipPhase() {
+  if (state.status !== STATUS.running && state.status !== STATUS.paused) return;
+  return advanceToNextPhase({ viaSkip: true });
+}
+
 function tick() {
   if (state.timeRemaining > 0) {
     state.timeRemaining -= 1;
   }
+
+  maybePlayCountdownBeeps();
 
   if (state.timeRemaining > 0) {
     render();
@@ -132,24 +210,31 @@ function tick() {
 
   state.timeRemaining = 0;
 
-  // Transition immediately when hitting 0.
-  if (state.currentPhase === PHASE.work) {
-    state.currentPhase = PHASE.rest;
-    state.timeRemaining = state.restDuration;
-    render();
-    return;
-  }
+  advanceToNextPhase({ viaSkip: false });
+}
 
-  // Rest ended.
-  if (state.currentRound >= state.totalRounds) {
-    done();
-    return;
-  }
+function shouldPlayFinalThreeBeeps() {
+  if (state.status !== STATUS.running) return false;
+  if (state.timeRemaining > 3 || state.timeRemaining < 1) return false;
 
-  state.currentRound += 1;
-  state.currentPhase = PHASE.work;
-  state.timeRemaining = state.workDuration;
-  render();
+  // Final 3 seconds of:
+  // - initial countdown
+  // - every work phase
+  // - every rest phase except the final round's
+  if (state.currentPhase === PHASE.countdown) return true;
+  if (state.currentPhase === PHASE.work) return true;
+  if (state.currentPhase === PHASE.rest) {
+    return state.currentRound < state.totalRounds;
+  }
+  return false;
+}
+
+function maybePlayCountdownBeeps() {
+  if (!shouldPlayFinalThreeBeeps()) return;
+  const key = `${state.currentPhase}:${state.currentRound}:${state.timeRemaining}`;
+  if (lastCountdownBeepAt === key) return;
+  lastCountdownBeepAt = key;
+  playCountdownBeep();
 }
 
 function setConfigFromSetup({ workDuration, restDuration, totalRounds }) {
@@ -238,13 +323,22 @@ function renderSetup() {
 
 function renderRunOrDone() {
   const isDone = state.status === STATUS.done;
+  const isCountdown = state.currentPhase === PHASE.countdown;
   const isWork = state.currentPhase === PHASE.work;
-  const themeClass = isDone ? "doneTheme" : isWork ? "workTheme" : "restTheme";
+  const themeClass = isDone
+    ? "doneTheme"
+    : isCountdown
+      ? "countdownTheme"
+      : isWork
+        ? "workTheme"
+        : "restTheme";
   const label = isDone ? "DONE" : phaseLabel(state.currentPhase);
 
   const roundText = isDone
     ? `Completed ${state.totalRounds} round${state.totalRounds === 1 ? "" : "s"}`
-    : `Round ${state.currentRound} of ${state.totalRounds}`;
+    : isCountdown
+      ? "Starting in…"
+      : `Round ${state.currentRound} of ${state.totalRounds}`;
 
   const countdownText = isDone ? "00:00" : formatMMSS(state.timeRemaining);
 
@@ -263,11 +357,19 @@ function renderRunOrDone() {
       </div>
 
       <div class="run">
-        <section class="phaseBanner ${themeClass}" aria-live="polite">
+        <section id="phaseBanner" class="phaseBanner ${themeClass}" aria-live="polite">
           <div class="phaseLabel">${label}</div>
           <div class="countdown" aria-label="Time remaining">${countdownText}</div>
           <div class="meta">
-            <span>${isDone ? "Workout complete" : (isWork ? "Work phase" : "Rest phase")}</span>
+            <span>${
+              isDone
+                ? "Workout complete"
+                : isCountdown
+                  ? "Get ready"
+                  : isWork
+                    ? "Work phase"
+                    : "Rest phase"
+            }</span>
             <span>${isDone ? "" : (state.status === STATUS.paused ? "Paused" : "Running")}</span>
           </div>
         </section>
@@ -287,6 +389,8 @@ function wireEvents() {
   const startBtn = document.querySelector("#startBtn");
   if (startBtn) {
     startBtn.addEventListener("click", () => {
+      ensureAudioUnlocked();
+
       // Read current UI picks right at Start.
       const workSelect = document.querySelector("#workSelect");
       const restSelect = document.querySelector("#restSelect");
@@ -339,8 +443,23 @@ function wireEvents() {
       resetToSetup();
     });
   }
+
+  const phaseBanner = document.querySelector("#phaseBanner");
+  if (phaseBanner) {
+    phaseBanner.addEventListener("click", () => {
+      if (state.status === STATUS.done) return;
+      skipPhase();
+    });
+  }
 }
 
 // Safety: stop timers if the tab is backgrounded or closed.
 window.addEventListener("beforeunload", () => stopInterval());
+
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState !== "visible") return;
+  if (state.status === STATUS.running) {
+    requestWakeLockIfSupported();
+  }
+});
 

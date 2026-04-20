@@ -175,6 +175,10 @@ button:disabled {
   background: linear-gradient(135deg, rgba(59, 130, 246, 0.42), rgba(59, 130, 246, 0.14));
 }
 
+.countdownTheme {
+  background: linear-gradient(135deg, rgba(245, 158, 11, 0.34), rgba(245, 158, 11, 0.12));
+}
+
 .doneTheme {
   background: linear-gradient(135deg, rgba(255, 255, 255, 0.18), rgba(0, 0, 0, 0.06));
 }
