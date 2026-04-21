@@ -1,31 +1,26 @@
 import "./style.css";
+import { ensureAudioUnlocked } from "./audio.js";
+import { ensureSpeechUnlocked, speak } from "./voice.js";
+import { createPhaseEngine } from "./phaseEngine.js";
 import {
-  ensureAudioUnlocked,
-  playCountdownBeep,
-  playRestStart,
-  playWorkStart,
-  playWorkoutComplete,
-} from "./audio.js";
-import {
-  releaseWakeLock,
-  requestWakeLockIfSupported,
-} from "./wakeLock.js";
-import { cancelSpeech, ensureSpeechUnlocked, speak } from "./voice.js";
+  buildAmrapPhases,
+  buildEmomPhases,
+  buildTabataPhases,
+  totalAmrapSeconds,
+  totalEmomSeconds,
+  totalTabataSeconds,
+} from "./phases.js";
 
 function getAppRoot() {
   return document.getElementById("app");
 }
 
-const PHASE = {
-  countdown: "countdown",
-  work: "work",
-  rest: "rest",
-};
-
-const STATUS = {
-  setup: "setup",
+const VIEW = {
+  home: "home",
+  tabataSetup: "tabata-setup",
+  emomSetup: "emom-setup",
+  amrapSetup: "amrap-setup",
   running: "running",
-  paused: "paused",
   done: "done",
 };
 
@@ -50,14 +45,6 @@ function buildDurationOptions() {
   return opts;
 }
 
-/** Matches current app: 10s initial countdown + N×work + (N−1)×rest (no rest after final work). */
-const INITIAL_COUNTDOWN_SECONDS = 10;
-
-function totalWorkoutSeconds(workSec, restSec, rounds) {
-  const n = Math.max(1, Math.floor(rounds));
-  return INITIAL_COUNTDOWN_SECONDS + n * workSec + (n - 1) * restSec;
-}
-
 let durationOptionsCache = null;
 function getDurationOptions() {
   if (!durationOptionsCache) {
@@ -66,34 +53,62 @@ function getDurationOptions() {
   return durationOptionsCache;
 }
 
-const state = {
-  // Config (seconds / integer)
-  workDuration: 20,
-  restDuration: 10,
-  totalRounds: 8,
+function buildAmrapDurationOptions() {
+  const opts = [];
+  // 0:15 → 5:00 in 15s steps (20 options)
+  for (let seconds = 15; seconds <= 300; seconds += 15) {
+    opts.push({ seconds, label: formatMMSS(seconds) });
+  }
+  // 6:00 → 30:00 in 1m steps (25 options)
+  for (let seconds = 360; seconds <= 1800; seconds += 60) {
+    opts.push({ seconds, label: formatMMSS(seconds) });
+  }
+  return opts;
+}
 
-  // Runtime
-  timeRemaining: 20,
-  isRunning: false,
-  currentPhase: PHASE.work,
-  currentRound: 1,
-  status: STATUS.setup,
+let amrapDurationOptionsCache = null;
+function getAmrapDurationOptions() {
+  if (!amrapDurationOptionsCache) {
+    amrapDurationOptionsCache = buildAmrapDurationOptions();
+  }
+  return amrapDurationOptionsCache;
+}
+
+const state = {
+  view: VIEW.home,
+  activeFormat: null, // "tabata" | "emom" | "amrap" | null
+  showCancelConfirm: false,
+
+  // Tabata config
+  tabataWorkDuration: 20,
+  tabataRestDuration: 10,
+  tabataTotalRounds: 8,
+
+  // EMOM config
+  emomIntervalDuration: 60,
+  emomTotalRounds: 10,
+
+  // AMRAP config
+  amrapWorkDuration: 600,
 
   // Audio toggles (no persistence by design)
   voiceEnabled: true,
   beepsEnabled: true,
-
-  // Smooth progress bar timing
-  phaseEndsAtMs: null,
-  phaseDurationMs: null,
-  pausedPhaseRemainingMs: null,
+  voiceAvailable: true, // set on Start; false if speechSynthesis unavailable/blocked
+  lastWorkout: null, // { format: "tabata"|"emom"|"amrap", phases: Phase[] }
 };
 
-let intervalId = null;
-let lastCountdownBeepAt = null; // string key: `${phase}:${round}:${seconds}`
-let rafId = null;
-let lastRoundCalloutAt = null; // `${phase}:${round}:${seconds}`
-let lastTickShownSeconds = null;
+const engine = createPhaseEngine({
+  onChange: (s) => {
+    if (s?.status === "done") state.view = VIEW.done;
+    render();
+  },
+  onProgress: (p) => {
+    const banner = document.querySelector("#phaseBanner");
+    if (!banner) return;
+    banner.style.setProperty("--p", String(p ?? 0));
+  },
+});
 
 function boot() {
   try {
@@ -116,11 +131,6 @@ if (document.readyState === "loading") {
   document.addEventListener("DOMContentLoaded", boot);
 } else {
   boot();
-}
-
-function phaseLabel(phase) {
-  if (phase === PHASE.countdown) return "GET READY";
-  return phase === PHASE.work ? "WORK" : "REST";
 }
 
 function speakerOnIcon() {
@@ -158,308 +168,205 @@ function bellOffIcon() {
   `;
 }
 
-function stopInterval() {
-  if (intervalId != null) {
-    clearInterval(intervalId);
-    intervalId = null;
-  }
+function backIcon() {
+  return `
+    <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+      <path fill="currentColor" d="M15.5 5.5a1 1 0 0 1 0 1.4L10.4 12l5.1 5.1a1 1 0 1 1-1.4 1.4l-5.8-5.8a1 1 0 0 1 0-1.4l5.8-5.8a1 1 0 0 1 1.4 0Z"/>
+    </svg>
+  `;
 }
 
-function startInterval() {
-  stopInterval();
-  intervalId = setInterval(() => {
-    if (!state.isRunning || state.status !== STATUS.running) return;
-    tick();
-  }, 1000);
-  startProgressLoop();
+function closeIcon() {
+  return `
+    <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+      <path fill="currentColor" d="M18.3 5.7a1 1 0 0 1 0 1.4L13.4 12l4.9 4.9a1 1 0 1 1-1.4 1.4L12 13.4l-4.9 4.9a1 1 0 1 1-1.4-1.4l4.9-4.9L5.7 7.1a1 1 0 0 1 1.4-1.4l4.9 4.9l4.9-4.9a1 1 0 0 1 1.4 0Z"/>
+    </svg>
+  `;
 }
 
-function startProgressLoop() {
-  if (rafId != null) return;
-
-  const loop = () => {
-    rafId = requestAnimationFrame(loop);
-    if (state.status !== STATUS.running) return;
-
-    const banner = document.querySelector("#phaseBanner");
-    if (!banner) return;
-
-    const p = computeProgressNow();
-    banner.style.setProperty("--p", String(p));
-  };
-
-  rafId = requestAnimationFrame(loop);
+function playIcon() {
+  return `
+    <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+      <path fill="currentColor" d="M8.8 5.9c0-1.2 1.3-1.9 2.3-1.3l9.3 5.6c1 .6 1 2.1 0 2.7l-9.3 5.6c-1 .6-2.3-.1-2.3-1.3V5.9Z"/>
+    </svg>
+  `;
 }
 
-function stopProgressLoop() {
-  if (rafId == null) return;
-  cancelAnimationFrame(rafId);
-  rafId = null;
+function pauseIcon() {
+  return `
+    <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+      <path fill="currentColor" d="M7 6.5A1.5 1.5 0 0 1 8.5 5H10a1.5 1.5 0 0 1 1.5 1.5v11A1.5 1.5 0 0 1 10 19H8.5A1.5 1.5 0 0 1 7 17.5v-11Zm5.5 0A1.5 1.5 0 0 1 14 5h1.5A1.5 1.5 0 0 1 17 6.5v11A1.5 1.5 0 0 1 15.5 19H14a1.5 1.5 0 0 1-1.5-1.5v-11Z"/>
+    </svg>
+  `;
 }
 
-function setStatus(nextStatus) {
-  state.status = nextStatus;
-  state.isRunning = nextStatus === STATUS.running;
-
-  if (state.isRunning) {
-    startInterval();
-    requestWakeLockIfSupported();
-  } else {
-    stopInterval();
-    stopProgressLoop();
-    releaseWakeLock();
-  }
-
+function goHome() {
+  engine.reset();
+  state.view = VIEW.home;
+  state.activeFormat = null;
+  state.showCancelConfirm = false;
   render();
 }
 
-function enterPhase(phase, durationSeconds) {
-  state.currentPhase = phase;
-  state.timeRemaining = durationSeconds;
-  state.phaseDurationMs = durationSeconds * 1000;
-  state.phaseEndsAtMs = Date.now() + state.phaseDurationMs;
-  state.pausedPhaseRemainingMs = null;
-  lastCountdownBeepAt = null;
-  lastRoundCalloutAt = null;
-}
-
-function startWorkout() {
-  state.currentRound = 1;
-  enterPhase(PHASE.countdown, 10);
-  setStatus(STATUS.running);
-}
-
-function pause() {
-  if (state.status !== STATUS.running) return;
-  cancelSpeech();
-  if (state.phaseEndsAtMs != null) {
-    state.pausedPhaseRemainingMs = Math.max(0, state.phaseEndsAtMs - Date.now());
-  }
-  setStatus(STATUS.paused);
-}
-
-function resume() {
-  if (state.status !== STATUS.paused) return;
-  if (state.pausedPhaseRemainingMs != null) {
-    state.phaseEndsAtMs = Date.now() + state.pausedPhaseRemainingMs;
-    state.pausedPhaseRemainingMs = null;
-  }
-  setStatus(STATUS.running);
-}
-
-function resetToSetup() {
-  stopInterval();
-  stopProgressLoop();
-  releaseWakeLock();
-  cancelSpeech();
-
-  state.status = STATUS.setup;
-  state.isRunning = false;
-
-  // Preserve the user's selected settings; reset runtime fields.
-  state.currentRound = 1;
-  state.currentPhase = PHASE.work;
-  state.timeRemaining = state.workDuration;
-  state.phaseEndsAtMs = null;
-  state.phaseDurationMs = null;
-  state.pausedPhaseRemainingMs = null;
-
+function goToTabataSetup() {
+  engine.reset();
+  state.view = VIEW.tabataSetup;
+  state.activeFormat = "tabata";
+  state.showCancelConfirm = false;
   render();
 }
 
-function done() {
-  setStatus(STATUS.done);
-  state.timeRemaining = 0;
-  state.phaseEndsAtMs = null;
-  state.phaseDurationMs = null;
-  state.pausedPhaseRemainingMs = null;
-  cancelSpeech();
+function goToEmomSetup() {
+  engine.reset();
+  state.view = VIEW.emomSetup;
+  state.activeFormat = "emom";
+  state.showCancelConfirm = false;
   render();
 }
 
-function finishWorkout() {
-  if (state.beepsEnabled) playWorkoutComplete();
-  done();
-  if (state.voiceEnabled) speak("Done, nice job!");
-}
-
-function advanceToNextPhase({ viaSkip }) {
-  const fromPhase = state.currentPhase;
-  const fromRound = state.currentRound;
-
-  // countdown -> work (round 1)
-  if (state.currentPhase === PHASE.countdown) {
-    state.currentRound = 1;
-    enterPhase(PHASE.work, state.workDuration);
-    // Work begins here (either naturally after countdown or via skip).
-    if (viaSkip && state.voiceEnabled) speak("Round one");
-    if (state.beepsEnabled) playWorkStart();
-    render();
-    return {
-      from: fromPhase,
-      fromRound,
-      next: PHASE.work,
-      done: false,
-      viaSkip,
-    };
-  }
-
-  // work -> rest (same round), except after the final work — no rest, workout ends
-  if (state.currentPhase === PHASE.work) {
-    if (state.currentRound === state.totalRounds) {
-      finishWorkout();
-      return { next: null, done: true, viaSkip };
-    }
-    enterPhase(PHASE.rest, state.restDuration);
-    if (state.beepsEnabled) playRestStart();
-    if (state.voiceEnabled) speak("Rest");
-    render();
-    return {
-      from: fromPhase,
-      fromRound,
-      next: PHASE.rest,
-      done: false,
-      viaSkip,
-    };
-  }
-
-  // rest -> next work (final round never has a rest phase)
-  state.currentRound += 1;
-  enterPhase(PHASE.work, state.workDuration);
-  if (viaSkip) {
-    if (state.voiceEnabled) {
-      if (state.currentRound === state.totalRounds) speak("Last Round");
-      else speak(`Round ${state.currentRound}`);
-    }
-  }
-  if (state.beepsEnabled) playWorkStart();
+function goToAmrapSetup() {
+  engine.reset();
+  state.view = VIEW.amrapSetup;
+  state.activeFormat = "amrap";
+  state.showCancelConfirm = false;
   render();
-  return { next: PHASE.work, done: false, viaSkip };
 }
 
-function skipPhase() {
-  if (state.status !== STATUS.running && state.status !== STATUS.paused) return;
-  return advanceToNextPhase({ viaSkip: true });
+function goBackToActiveSetup() {
+  engine.reset();
+  if (state.activeFormat === "tabata") state.view = VIEW.tabataSetup;
+  else if (state.activeFormat === "emom") state.view = VIEW.emomSetup;
+  else if (state.activeFormat === "amrap") state.view = VIEW.amrapSetup;
+  else state.view = VIEW.home;
+  state.showCancelConfirm = false;
+  render();
 }
 
-function tick() {
-  // Keep the display aligned to wall-clock time so the progress bar stays smooth.
-  const prevShown = state.timeRemaining;
-  if (state.phaseEndsAtMs != null) {
-    const remainingMs = Math.max(0, state.phaseEndsAtMs - Date.now());
-    // Avoid boundary skips when remainingMs hits an exact multiple of 1000.
-    // Example seen in logs: 8001ms -> 9, then 7000ms -> 7 (skipping 8).
-    const durationMs = state.phaseDurationMs ?? null;
-    const boundaryBump =
-      remainingMs > 0 &&
-      remainingMs % 1000 === 0 &&
-      durationMs != null &&
-      remainingMs !== durationMs;
-    const remainingSeconds = Math.ceil(remainingMs / 1000) + (boundaryBump ? 1 : 0);
-    state.timeRemaining = remainingSeconds;
-  }
+function startTabataFromUI() {
+  ensureAudioUnlocked();
+  state.voiceAvailable = ensureSpeechUnlocked();
+  state.showCancelConfirm = false;
 
-  maybeSpeakRoundAfterBeeps(prevShown, state.timeRemaining);
-  maybePlayCountdownBeepsCrossing(prevShown, state.timeRemaining);
+  const workSelect = document.querySelector("#workSelect");
+  const restSelect = document.querySelector("#restSelect");
+  const roundsSelect = document.querySelector("#roundsSelect");
 
-  if (state.timeRemaining > 0) {
-    render();
-    return;
-  }
+  state.tabataWorkDuration = Number(workSelect?.value ?? state.tabataWorkDuration);
+  state.tabataRestDuration = Number(restSelect?.value ?? state.tabataRestDuration);
+  state.tabataTotalRounds = Number(roundsSelect?.value ?? state.tabataTotalRounds);
 
-  state.timeRemaining = 0;
+  const phases = buildTabataPhases({
+    workDuration: state.tabataWorkDuration,
+    restDuration: state.tabataRestDuration,
+    totalRounds: state.tabataTotalRounds,
+  });
 
-  advanceToNextPhase({ viaSkip: false });
+  state.lastWorkout = { format: "tabata", phases };
+  state.activeFormat = "tabata";
+  state.view = VIEW.running;
+  engine.start(phases, {
+    voiceEnabled: state.voiceEnabled && state.voiceAvailable,
+    beepsEnabled: state.beepsEnabled,
+  });
+  render();
 }
 
-function maybeSpeakRoundAfterBeeps(prevShown, nowShown) {
-  if (state.status !== STATUS.running) return;
+function startEmomFromUI() {
+  ensureAudioUnlocked();
+  state.voiceAvailable = ensureSpeechUnlocked();
+  state.showCancelConfirm = false;
 
-  // New behavior: voice comes after the 3-2-1 beeps, right before work begins.
-  // Trigger when countdown/rest hits 0 (or crosses to 0).
-  if (!(state.currentPhase === PHASE.countdown || state.currentPhase === PHASE.rest))
-    return;
+  const intervalSelect = document.querySelector("#intervalSelect");
+  const roundsSelect = document.querySelector("#emomRoundsSelect");
 
-  const crossedToZero = prevShown > 0 && nowShown <= 0;
-  const atZero = nowShown === 0;
-  if (!crossedToZero && !atZero) return;
+  state.emomIntervalDuration = Number(
+    intervalSelect?.value ?? state.emomIntervalDuration
+  );
+  state.emomTotalRounds = Number(roundsSelect?.value ?? state.emomTotalRounds);
 
-  const key = `${state.currentPhase}:${state.currentRound}:to-work`;
-  if (lastRoundCalloutAt === key) return;
+  const phases = buildEmomPhases({
+    intervalDuration: state.emomIntervalDuration,
+    totalRounds: state.emomTotalRounds,
+  });
 
-  if (state.currentPhase === PHASE.countdown) {
-    lastRoundCalloutAt = key;
-    if (state.voiceEnabled) speak("Round one");
-    return;
-  }
-
-  // rest -> upcoming work (unless this is final rest, which goes to done)
-  if (state.currentRound >= state.totalRounds) return;
-  const nextRound = state.currentRound + 1;
-  lastRoundCalloutAt = key;
-  if (state.voiceEnabled) {
-    if (nextRound === state.totalRounds) speak("Last Round");
-    else speak(`Round ${nextRound}`);
-  }
+  state.lastWorkout = { format: "emom", phases };
+  state.activeFormat = "emom";
+  state.view = VIEW.running;
+  engine.start(phases, {
+    voiceEnabled: state.voiceEnabled && state.voiceAvailable,
+    beepsEnabled: state.beepsEnabled,
+  });
+  render();
 }
 
-function computeProgressNow() {
-  if (state.status !== STATUS.running) return 0;
-  if (!state.phaseEndsAtMs || !state.phaseDurationMs) return 0;
-  const now = Date.now();
-  const elapsed = state.phaseDurationMs - Math.max(0, state.phaseEndsAtMs - now);
-  const p = elapsed / state.phaseDurationMs;
-  return Math.max(0, Math.min(1, p));
-}
+function updateTabataStartLabelFromInputs() {
+  const workSelect = document.querySelector("#workSelect");
+  const restSelect = document.querySelector("#restSelect");
+  const roundsSelect = document.querySelector("#roundsSelect");
 
-function shouldPlayFinalThreeBeeps() {
-  if (state.status !== STATUS.running) return false;
-  if (state.timeRemaining > 3 || state.timeRemaining < 1) return false;
+  const workDuration = Number(workSelect?.value ?? state.tabataWorkDuration);
+  const restDuration = Number(restSelect?.value ?? state.tabataRestDuration);
+  const totalRounds = Number(roundsSelect?.value ?? state.tabataTotalRounds);
 
-  // Final 3 seconds of:
-  // - initial countdown
-  // - every work phase
-  // - every rest phase except the final round's
-  if (state.currentPhase === PHASE.countdown) return true;
-  if (state.currentPhase === PHASE.work) return true;
-  if (state.currentPhase === PHASE.rest) {
-    return state.currentRound < state.totalRounds;
-  }
-  return false;
-}
+  const totalSec = totalTabataSeconds({ workDuration, restDuration, totalRounds });
+  const totalLabel = formatMMSS(totalSec);
 
-function maybePlayCountdownBeepsCrossing(prevShown, nowShown) {
-  if (state.status !== STATUS.running) return;
-
-  // Fire beeps for 3/2/1 even if the display skips a number.
-  for (const s of [3, 2, 1]) {
-    const crossed = prevShown > s && nowShown <= s;
-    const at = nowShown === s;
-    if (!crossed && !at) continue;
-
-    // Respect the "final rest has no beeps" rule.
-    if (state.currentPhase === PHASE.rest && state.currentRound >= state.totalRounds) {
-      continue;
-    }
-
-    const key = `${state.currentPhase}:${state.currentRound}:${s}`;
-    if (lastCountdownBeepAt === key) continue;
-    lastCountdownBeepAt = key;
-    if (state.beepsEnabled) playCountdownBeep();
+  const startBtn = document.querySelector("#startTabataBtn");
+  if (startBtn) {
+    startBtn.textContent = `Start · ${totalLabel}`;
+    startBtn.setAttribute("aria-label", `Start workout, total time ${totalLabel}`);
   }
 }
 
-function setConfigFromSetup({ workDuration, restDuration, totalRounds }) {
-  state.workDuration = workDuration;
-  state.restDuration = restDuration;
-  state.totalRounds = totalRounds;
+function updateEmomStartLabelFromInputs() {
+  const intervalSelect = document.querySelector("#intervalSelect");
+  const roundsSelect = document.querySelector("#emomRoundsSelect");
 
-  // Keep runtime aligned with config while still on setup.
-  if (state.status === STATUS.setup) {
-    state.currentRound = 1;
-    state.currentPhase = PHASE.work;
-    state.timeRemaining = state.workDuration;
+  const intervalDuration = Number(intervalSelect?.value ?? state.emomIntervalDuration);
+  const totalRounds = Number(roundsSelect?.value ?? state.emomTotalRounds);
+
+  const totalSec = totalEmomSeconds({ intervalDuration, totalRounds });
+  const totalLabel = formatMMSS(totalSec);
+
+  const startBtn = document.querySelector("#startEmomBtn");
+  if (startBtn) {
+    startBtn.textContent = `Start · ${totalLabel}`;
+    startBtn.setAttribute("aria-label", `Start workout, total time ${totalLabel}`);
   }
+}
+
+function updateAmrapStartLabelFromInputs() {
+  const durationSelect = document.querySelector("#amrapDurationSelect");
+  const workDuration = Number(durationSelect?.value ?? state.amrapWorkDuration);
+
+  const totalSec = totalAmrapSeconds({ workDuration });
+  const totalLabel = formatMMSS(totalSec);
+
+  const startBtn = document.querySelector("#startAmrapBtn");
+  if (startBtn) {
+    startBtn.textContent = `Start · ${totalLabel}`;
+    startBtn.setAttribute("aria-label", `Start workout, total time ${totalLabel}`);
+  }
+}
+
+function startAmrapFromUI() {
+  ensureAudioUnlocked();
+  state.voiceAvailable = ensureSpeechUnlocked();
+  state.showCancelConfirm = false;
+
+  const durationSelect = document.querySelector("#amrapDurationSelect");
+  state.amrapWorkDuration = Number(durationSelect?.value ?? state.amrapWorkDuration);
+
+  const phases = buildAmrapPhases({ workDuration: state.amrapWorkDuration });
+
+  state.lastWorkout = { format: "amrap", phases };
+  state.activeFormat = "amrap";
+  state.view = VIEW.running;
+  engine.start(phases, {
+    voiceEnabled: state.voiceEnabled && state.voiceAvailable,
+    beepsEnabled: state.beepsEnabled,
+  });
+  render();
 }
 
 function render() {
@@ -467,26 +374,73 @@ function render() {
   if (!root) return;
 
   const view =
-    state.status === STATUS.setup ? renderSetup() : renderRunOrDone();
+    state.view === VIEW.home
+      ? renderHome()
+      : state.view === VIEW.tabataSetup
+        ? renderTabataSetup()
+        : state.view === VIEW.emomSetup
+          ? renderEmomSetup()
+          : state.view === VIEW.amrapSetup
+            ? renderAmrapSetup()
+          : renderRunOrDone();
 
   root.innerHTML = view;
   wireEvents();
 }
 
-function renderSetup() {
-  const totalSec = totalWorkoutSeconds(
-    state.workDuration,
-    state.restDuration,
-    state.totalRounds
-  );
+function renderHome() {
+  return `
+    <main class="card" aria-label="Choose timer format">
+      <div class="header">
+        <div class="headerMain">
+          <h1 class="title title--display">Workout Timers</h1>
+          <p class="subtitle">Choose a format</p>
+        </div>
+      </div>
+
+      <div class="content">
+        <div class="menuList" role="list">
+          <button id="pickTabataBtn" class="primary" type="button" aria-label="Tabata timer">
+            Tabata
+          </button>
+          <button id="pickEmomBtn" class="primary" type="button" aria-label="EMOM timer">
+            EMOM
+          </button>
+          <button id="pickAmrapBtn" class="primary" type="button" aria-label="AMRAP timer">
+            AMRAP
+          </button>
+        </div>
+      </div>
+    </main>
+  `;
+}
+
+function renderTabataSetup() {
+  const totalSec = totalTabataSeconds({
+    workDuration: state.tabataWorkDuration,
+    restDuration: state.tabataRestDuration,
+    totalRounds: state.tabataTotalRounds,
+  });
   const totalLabel = formatMMSS(totalSec);
   return `
     <main class="card" aria-label="Tabata timer setup">
       <div class="header">
-        <div>
-          <h1 class="title">Tabata Timer</h1>
-          <p class="subtitle">Stage 1 — core timer</p>
+        <div class="headerLeft" aria-label="Navigation">
+          <button
+            id="navBackBtn"
+            class="iconBtn"
+            type="button"
+            aria-label="Back"
+            title="Back"
+          >
+            ${backIcon()}
+          </button>
         </div>
+        <div class="headerMain">
+          <h1 class="title title--display">Tabata Timer</h1>
+          <p class="subtitle">Work and rest intervals</p>
+        </div>
+        <div class="headerRight" aria-hidden="true"></div>
       </div>
 
       <div class="content">
@@ -497,7 +451,7 @@ function renderSetup() {
               ${getDurationOptions().map(
                 (o) =>
                   `<option value="${o.seconds}" ${
-                    o.seconds === state.workDuration ? "selected" : ""
+                    o.seconds === state.tabataWorkDuration ? "selected" : ""
                   }>${o.label}</option>`
               ).join("")}
             </select>
@@ -509,7 +463,7 @@ function renderSetup() {
               ${getDurationOptions().map(
                 (o) =>
                   `<option value="${o.seconds}" ${
-                    o.seconds === state.restDuration ? "selected" : ""
+                    o.seconds === state.tabataRestDuration ? "selected" : ""
                   }>${o.label}</option>`
               ).join("")}
             </select>
@@ -525,7 +479,7 @@ function renderSetup() {
               .map(
                 (n) =>
                   `<option value="${n}" ${
-                    n === state.totalRounds ? "selected" : ""
+                    n === state.tabataTotalRounds ? "selected" : ""
                   }>${n}</option>`
               )
               .join("")}
@@ -533,7 +487,120 @@ function renderSetup() {
         </label>
 
         <div class="actions">
-          <button class="primary" id="startBtn" aria-label="Start workout, total time ${totalLabel}" type="button">Start · ${totalLabel}</button>
+          <button class="primary" id="startTabataBtn" aria-label="Start workout, total time ${totalLabel}" type="button">Start · ${totalLabel}</button>
+        </div>
+      </div>
+    </main>
+  `;
+}
+
+function renderEmomSetup() {
+  const totalSec = totalEmomSeconds({
+    intervalDuration: state.emomIntervalDuration,
+    totalRounds: state.emomTotalRounds,
+  });
+  const totalLabel = formatMMSS(totalSec);
+
+  return `
+    <main class="card" aria-label="EMOM timer setup">
+      <div class="header">
+        <div class="headerLeft" aria-label="Navigation">
+          <button
+            id="navBackBtn"
+            class="iconBtn"
+            type="button"
+            aria-label="Back"
+            title="Back"
+          >
+            ${backIcon()}
+          </button>
+        </div>
+        <div class="headerMain">
+          <h1 class="title title--display">EMOM</h1>
+          <p class="subtitle">Equal-length rounds back-to-back</p>
+        </div>
+        <div class="headerRight" aria-hidden="true"></div>
+      </div>
+
+      <div class="content">
+        <div class="row">
+          <label>
+            Interval
+            <select id="intervalSelect" aria-label="Interval duration">
+              ${getDurationOptions().map(
+                (o) =>
+                  `<option value="${o.seconds}" ${
+                    o.seconds === state.emomIntervalDuration ? "selected" : ""
+                  }>${o.label}</option>`
+              ).join("")}
+            </select>
+          </label>
+
+          <label>
+            Rounds
+            <select id="emomRoundsSelect" aria-label="Number of rounds">
+              ${Array.from({ length: 20 }, (_, i) => i + 1)
+                .map(
+                  (n) =>
+                    `<option value="${n}" ${
+                      n === state.emomTotalRounds ? "selected" : ""
+                    }>${n}</option>`
+                )
+                .join("")}
+            </select>
+          </label>
+        </div>
+
+        <div class="actions">
+          <button class="primary" id="startEmomBtn" aria-label="Start workout, total time ${totalLabel}" type="button">Start · ${totalLabel}</button>
+        </div>
+      </div>
+    </main>
+  `;
+}
+
+function renderAmrapSetup() {
+  const totalSec = totalAmrapSeconds({ workDuration: state.amrapWorkDuration });
+  const totalLabel = formatMMSS(totalSec);
+
+  return `
+    <main class="card" aria-label="AMRAP timer setup">
+      <div class="header">
+        <div class="headerLeft" aria-label="Navigation">
+          <button
+            id="navBackBtn"
+            class="iconBtn"
+            type="button"
+            aria-label="Back"
+            title="Back"
+          >
+            ${backIcon()}
+          </button>
+        </div>
+        <div class="headerMain">
+          <h1 class="title title--display">AMRAP</h1>
+          <p class="subtitle">As many rounds as possible</p>
+        </div>
+        <div class="headerRight" aria-hidden="true"></div>
+      </div>
+
+      <div class="content">
+        <label>
+          Duration
+          <select id="amrapDurationSelect" aria-label="AMRAP duration">
+            ${getAmrapDurationOptions()
+              .map(
+                (o) =>
+                  `<option value="${o.seconds}" ${
+                    o.seconds === state.amrapWorkDuration ? "selected" : ""
+                  }>${o.label}</option>`
+              )
+              .join("")}
+          </select>
+        </label>
+
+        <div class="actions">
+          <button class="primary" id="startAmrapBtn" aria-label="Start workout, total time ${totalLabel}" type="button">Start · ${totalLabel}</button>
         </div>
       </div>
     </main>
@@ -541,9 +608,20 @@ function renderSetup() {
 }
 
 function renderRunOrDone() {
-  const isDone = state.status === STATUS.done;
-  const isCountdown = state.currentPhase === PHASE.countdown;
-  const isWork = state.currentPhase === PHASE.work;
+  const eng = engine.getState();
+  const isDone = state.view === VIEW.done || eng.status === "done";
+  const isActive = eng.status === "running" || eng.status === "paused";
+  const formatTitle =
+    state.activeFormat === "tabata"
+      ? "Tabata"
+      : state.activeFormat === "emom"
+        ? "EMOM"
+        : state.activeFormat === "amrap"
+          ? "AMRAP"
+          : "WOD Timer";
+  const phaseType = eng.currentPhase?.type ?? "done";
+  const isCountdown = phaseType === "countdown";
+  const isWork = phaseType === "work";
   const themeClass = isDone
     ? "doneTheme"
     : isCountdown
@@ -551,34 +629,71 @@ function renderRunOrDone() {
       : isWork
         ? "workTheme"
         : "restTheme";
-  const label = isDone ? "DONE" : phaseLabel(state.currentPhase);
+  const label = isDone ? "DONE" : String(eng.currentPhase?.label ?? "");
+
+  const round = Number(eng.currentPhase?.round ?? 0);
+  const totalRounds = Number(eng.currentPhase?.totalRounds ?? 0);
 
   const roundText = isDone
-    ? `Completed ${state.totalRounds} round${state.totalRounds === 1 ? "" : "s"}`
-    : isCountdown
-      ? "Starting in…"
-      : `Round ${state.currentRound} of ${state.totalRounds}`;
+    ? state.lastWorkout
+      ? completedRoundsText(state.lastWorkout)
+        ? `Completed ${completedRoundsText(state.lastWorkout)}`
+        : "Workout complete"
+      : "Workout complete"
+    : round && totalRounds
+      ? `Round ${round} of ${totalRounds}`
+      : isCountdown
+        ? "Starting in…"
+        : "";
 
-  const countdownText = isDone ? "00:00" : formatMMSS(state.timeRemaining);
+  const countdownText = isDone ? "00:00" : formatMMSS(eng.timeRemaining);
 
-  const pauseResumeText =
-    state.status === STATUS.running ? "Pause" : "Resume";
-  const showGoAgain = isDone;
+  const pauseResumeLabel = eng.status === "running" ? "Pause" : "Resume";
+  const showGoAgain = isDone && !!state.lastWorkout?.phases?.length;
+  // Voice status is available via the toggle button; keep header uncluttered.
 
   return `
-    <main class="card" aria-label="Tabata timer running">
+    <main class="card" aria-label="Timer running">
       <div class="header">
-        <div>
-          <h1 class="title">Tabata Timer</h1>
+        ${
+          state.activeFormat
+            ? `<div class="headerLeft" aria-label="Navigation">
+                <button
+                  id="navBackBtn"
+                  class="iconBtn iconBtn--danger"
+                  type="button"
+                  aria-label="Cancel timer"
+                  title="Cancel timer"
+                >
+                  ${closeIcon()}
+                </button>
+              </div>`
+            : `<div class="headerLeft" aria-hidden="true"></div>`
+        }
+        <div class="headerMain">
+          <h1 class="title title--display">${formatTitle}</h1>
           <p class="subtitle">${roundText}</p>
         </div>
-        <div class="headerRight" aria-label="Audio controls">
+        <div class="headerRight" aria-label="Controls">
           <button
             id="toggleVoiceBtn"
             class="iconBtn ${state.voiceEnabled ? "" : "isOff"}"
             type="button"
-            aria-label="${state.voiceEnabled ? "Mute voice" : "Unmute voice"}"
-            title="${state.voiceEnabled ? "Mute voice" : "Unmute voice"}"
+            ${state.voiceAvailable ? "" : "disabled"}
+            aria-label="${
+              state.voiceAvailable
+                ? state.voiceEnabled
+                  ? "Mute voice"
+                  : "Unmute voice"
+                : "Voice unavailable in this browser"
+            }"
+            title="${
+              state.voiceAvailable
+                ? state.voiceEnabled
+                  ? "Mute voice"
+                  : "Unmute voice"
+                : "Voice unavailable in this browser"
+            }"
           >
             ${state.voiceEnabled ? speakerOnIcon() : speakerOffIcon()}
           </button>
@@ -595,6 +710,20 @@ function renderRunOrDone() {
       </div>
 
       <div class="run">
+        ${
+          state.showCancelConfirm && isActive
+            ? `<div class="modalOverlay" role="presentation">
+                <div class="modal" role="dialog" aria-modal="true" aria-label="Cancel timer confirmation">
+                  <div class="modalTitle">Cancel timer?</div>
+                  <div class="modalBody subtitle">Are you sure you want to cancel and go back to setup?</div>
+                  <div class="modalActions">
+                    <button id="cancelConfirmNoBtn" type="button">Keep going</button>
+                    <button id="cancelConfirmYesBtn" class="danger" type="button">Cancel timer</button>
+                  </div>
+                </div>
+              </div>`
+            : ""
+        }
         <section id="phaseBanner" class="phaseBanner ${themeClass}" aria-live="polite">
           <div class="phaseLabel">${label}</div>
           <div class="countdown" aria-label="Time remaining">${countdownText}</div>
@@ -603,81 +732,151 @@ function renderRunOrDone() {
           </div>
         </section>
 
-        <div class="actions">
-          ${
-            isDone
-              ? ""
-              : `<button id="pauseResumeBtn" class="primary">${pauseResumeText}</button>`
-          }
-          ${
-            showGoAgain
-              ? `<button id="goAgainBtn" class="primary">Go again</button>`
-              : ""
-          }
-          <button id="resetBtn" class="danger">Reset</button>
-        </div>
+        ${
+          isDone
+            ? ""
+            : `<div class="actions actions--center">
+                <button
+                  id="pauseResumeBtn"
+                  class="roundBtn roundBtn--xl"
+                  type="button"
+                  aria-label="${pauseResumeLabel}"
+                  title="${pauseResumeLabel}"
+                >
+                  ${eng.status === "running" ? pauseIcon() : playIcon()}
+                </button>
+              </div>`
+        }
+        ${
+          showGoAgain
+            ? `<div class="actions">
+                <button id="goAgainBtn" class="primary">Go again</button>
+              </div>`
+            : ""
+        }
       </div>
     </main>
   `;
 }
 
+function completedRoundsText(lastWorkout) {
+  const phases = Array.isArray(lastWorkout?.phases) ? lastWorkout.phases : [];
+  const lastWork = [...phases].reverse().find((p) => p?.type === "work");
+  const rounds = Number(lastWork?.totalRounds ?? 0) || 0;
+  if (!rounds) return "";
+  return `${rounds} round${rounds === 1 ? "" : "s"}`;
+}
+
 function wireEvents() {
-  const startBtn = document.querySelector("#startBtn");
-  if (startBtn) {
-    startBtn.addEventListener("click", () => {
-      ensureAudioUnlocked();
-      ensureSpeechUnlocked();
+  const pickTabataBtn = document.querySelector("#pickTabataBtn");
+  if (pickTabataBtn) pickTabataBtn.addEventListener("click", goToTabataSetup);
 
-      // Read current UI picks right at Start.
-      const workSelect = document.querySelector("#workSelect");
-      const restSelect = document.querySelector("#restSelect");
-      const roundsSelect = document.querySelector("#roundsSelect");
+  const pickEmomBtn = document.querySelector("#pickEmomBtn");
+  if (pickEmomBtn) pickEmomBtn.addEventListener("click", goToEmomSetup);
 
-      const workDuration = Number(workSelect?.value ?? state.workDuration);
-      const restDuration = Number(restSelect?.value ?? state.restDuration);
-      const totalRounds = Number(roundsSelect?.value ?? state.totalRounds);
+  const pickAmrapBtn = document.querySelector("#pickAmrapBtn");
+  if (pickAmrapBtn) pickAmrapBtn.addEventListener("click", goToAmrapSetup);
 
-      setConfigFromSetup({
-        workDuration,
-        restDuration,
-        totalRounds,
-      });
+  const startTabataBtn = document.querySelector("#startTabataBtn");
+  if (startTabataBtn) startTabataBtn.addEventListener("click", startTabataFromUI);
 
-      startWorkout();
+  const workSelect = document.querySelector("#workSelect");
+  if (workSelect) {
+    workSelect.addEventListener("change", (e) => {
+      state.tabataWorkDuration = Number(e?.target?.value ?? state.tabataWorkDuration);
+      updateTabataStartLabelFromInputs();
+    });
+  }
+  const restSelect = document.querySelector("#restSelect");
+  if (restSelect) {
+    restSelect.addEventListener("change", (e) => {
+      state.tabataRestDuration = Number(e?.target?.value ?? state.tabataRestDuration);
+      updateTabataStartLabelFromInputs();
+    });
+  }
+  const roundsSelect = document.querySelector("#roundsSelect");
+  if (roundsSelect) {
+    roundsSelect.addEventListener("change", (e) => {
+      state.tabataTotalRounds = Number(e?.target?.value ?? state.tabataTotalRounds);
+      updateTabataStartLabelFromInputs();
     });
   }
 
-  const workSelect = document.querySelector("#workSelect");
-  const restSelect = document.querySelector("#restSelect");
-  const roundsSelect = document.querySelector("#roundsSelect");
-
-  if (workSelect && restSelect && roundsSelect) {
-    const onChange = () => {
-      setConfigFromSetup({
-        workDuration: Number(workSelect.value),
-        restDuration: Number(restSelect.value),
-        totalRounds: Number(roundsSelect.value),
-      });
-      render();
-    };
-
-    workSelect.addEventListener("change", onChange);
-    restSelect.addEventListener("change", onChange);
-    roundsSelect.addEventListener("change", onChange);
+  const navBackBtn = document.querySelector("#navBackBtn");
+  if (navBackBtn) {
+    navBackBtn.addEventListener("click", () => {
+      if (state.view === VIEW.running || state.view === VIEW.done) {
+        const s = engine.getState();
+        const isActiveTimer = s.status === "running" || s.status === "paused";
+        if (isActiveTimer) {
+          state.showCancelConfirm = true;
+          render();
+          return;
+        }
+        goBackToActiveSetup();
+        return;
+      }
+      goHome();
+    });
   }
+
+  const cancelConfirmNoBtn = document.querySelector("#cancelConfirmNoBtn");
+  if (cancelConfirmNoBtn) {
+    cancelConfirmNoBtn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      state.showCancelConfirm = false;
+      render();
+    });
+  }
+
+  const cancelConfirmYesBtn = document.querySelector("#cancelConfirmYesBtn");
+  if (cancelConfirmYesBtn) {
+    cancelConfirmYesBtn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      goBackToActiveSetup();
+    });
+  }
+
+  const startEmomBtn = document.querySelector("#startEmomBtn");
+  if (startEmomBtn) startEmomBtn.addEventListener("click", startEmomFromUI);
+
+  const intervalSelect = document.querySelector("#intervalSelect");
+  if (intervalSelect) {
+    intervalSelect.addEventListener("change", (e) => {
+      state.emomIntervalDuration = Number(e?.target?.value ?? state.emomIntervalDuration);
+      updateEmomStartLabelFromInputs();
+    });
+  }
+  const emomRoundsSelect = document.querySelector("#emomRoundsSelect");
+  if (emomRoundsSelect) {
+    emomRoundsSelect.addEventListener("change", (e) => {
+      state.emomTotalRounds = Number(e?.target?.value ?? state.emomTotalRounds);
+      updateEmomStartLabelFromInputs();
+    });
+  }
+
+  const amrapDurationSelect = document.querySelector("#amrapDurationSelect");
+  if (amrapDurationSelect) {
+    amrapDurationSelect.addEventListener("change", (e) => {
+      state.amrapWorkDuration = Number(e?.target?.value ?? state.amrapWorkDuration);
+      updateAmrapStartLabelFromInputs();
+    });
+  }
+
+  // Ensure labels are correct on first render of setup screens.
+  if (state.view === VIEW.tabataSetup) updateTabataStartLabelFromInputs();
+  if (state.view === VIEW.emomSetup) updateEmomStartLabelFromInputs();
+  if (state.view === VIEW.amrapSetup) updateAmrapStartLabelFromInputs();
+
+  const startAmrapBtn = document.querySelector("#startAmrapBtn");
+  if (startAmrapBtn) startAmrapBtn.addEventListener("click", startAmrapFromUI);
 
   const pauseResumeBtn = document.querySelector("#pauseResumeBtn");
   if (pauseResumeBtn) {
     pauseResumeBtn.addEventListener("click", () => {
-      if (state.status === STATUS.running) pause();
-      else if (state.status === STATUS.paused) resume();
-    });
-  }
-
-  const resetBtn = document.querySelector("#resetBtn");
-  if (resetBtn) {
-    resetBtn.addEventListener("click", () => {
-      resetToSetup();
+      const s = engine.getState();
+      if (s.status === "running") engine.pause();
+      else if (s.status === "paused") engine.resume();
     });
   }
 
@@ -686,7 +885,7 @@ function wireEvents() {
     toggleVoiceBtn.addEventListener("click", (e) => {
       e.stopPropagation();
       state.voiceEnabled = !state.voiceEnabled;
-      if (!state.voiceEnabled) cancelSpeech();
+      engine.setAudioToggles({ voiceEnabled: state.voiceEnabled });
       render();
     });
   }
@@ -696,6 +895,7 @@ function wireEvents() {
     toggleBeepsBtn.addEventListener("click", (e) => {
       e.stopPropagation();
       state.beepsEnabled = !state.beepsEnabled;
+      engine.setAudioToggles({ beepsEnabled: state.beepsEnabled });
       render();
     });
   }
@@ -703,27 +903,28 @@ function wireEvents() {
   const goAgainBtn = document.querySelector("#goAgainBtn");
   if (goAgainBtn) {
     goAgainBtn.addEventListener("click", () => {
-      // Re-run with the existing selected settings.
-      startWorkout();
+      ensureAudioUnlocked();
+      ensureSpeechUnlocked();
+      const phases = state.lastWorkout?.phases ?? null;
+      if (!Array.isArray(phases) || phases.length === 0) return;
+      state.view = VIEW.running;
+      engine.start(phases, { voiceEnabled: state.voiceEnabled, beepsEnabled: state.beepsEnabled });
     });
   }
 
   const phaseBanner = document.querySelector("#phaseBanner");
   if (phaseBanner) {
     phaseBanner.addEventListener("click", () => {
-      if (state.status === STATUS.done) return;
-      skipPhase();
+      const s = engine.getState();
+      if (s.status === "done" || state.view !== VIEW.running) return;
+      engine.skip();
     });
   }
-}
 
-// Safety: stop timers if the tab is backgrounded or closed.
-window.addEventListener("beforeunload", () => stopInterval());
-
-document.addEventListener("visibilitychange", () => {
-  if (document.visibilityState !== "visible") return;
-  if (state.status === STATUS.running) {
-    requestWakeLockIfSupported();
+  // Keep the progress bar updated even when engine re-renders via onChange.
+  const banner = document.querySelector("#phaseBanner");
+  if (banner) {
+    const p = engine.getState().progress ?? 0;
+    banner.style.setProperty("--p", String(p));
   }
-});
-
+}
